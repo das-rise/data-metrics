@@ -3,15 +3,18 @@
 Quality metrics for **video** (MP4) and **OmegaPrime** (MCAP) datasets, plus a
 dataset-level summary tool.
 
-The package provides two standalone command-line tools:
+The package provides three standalone command-line tools:
 
 | Tool | Purpose |
 |---|---|
 | `data_metrics.py` | Compute quality metrics for a **single** video or OmegaPrime MCAP file and write the result as JSON. |
 | `data_metrics_summary.py` | Aggregate many such JSON files under a directory into a **dataset-level** summary (tables + optional JSON). |
+| `traffic_density.py` | Compute **traffic density / speed / flow / LOS** for a scene from vehicle trajectories (OmegaPrime MCAP or OpenLABEL JSON) grounded on an OpenDRIVE map. |
 
 `data_metrics.py` depends on numpy, OpenCV, PyAV (video) and pandas + mcap
 (OmegaPrime). `data_metrics_summary.py` is pure Python standard library.
+`traffic_density.py` depends on pyproj + shapely (and pandas + mcap for the
+OmegaPrime source).
 
 ---
 
@@ -21,8 +24,9 @@ The package provides two standalone command-line tools:
 pip install .            # or: uv pip install .
 ```
 
-This installs two console commands, `data-metrics` and `data-metrics-summary`.
-You can also run the scripts directly (`./data_metrics.py`, `./data_metrics_summary.py`).
+This installs three console commands, `data-metrics`, `data-metrics-summary` and
+`traffic-density`. You can also run the scripts directly (`./data_metrics.py`,
+`./data_metrics_summary.py`, `./traffic_density.py`).
 
 ---
 
@@ -114,6 +118,48 @@ if it has a top-level `video` key and an **OmegaPrime** row if it has an `omegap
 key (a single file may contribute both). Files with neither are skipped. The tool
 prints aggregate statistics (mean / min / max / n) and a per-file breakdown, with
 sub-threshold values flagged.
+
+---
+
+## `traffic_density.py` — traffic density / flow metrics
+
+```
+traffic-density --opendrive MAP.xodr (--omegaprime FILE | --openlabel FILE)
+                [--expected-hz HZ] [--los-spec FILE] [--time-series] [--json FILE]
+```
+
+| Option | Meaning |
+|---|---|
+| `--opendrive FILE` | OpenDRIVE `.xodr` map supplying lane geometry, lengths and the drivable surface (**required**). |
+| `--omegaprime FILE` | OmegaPrime MCAP trajectory source (has velocity). |
+| `--openlabel FILE` | OpenLABEL JSON trajectory source (world cuboids); velocity is finite-differenced. May be plain or gzip/zip/bz2/xz compressed (auto-detected). |
+| `--expected-hz HZ` | Frame rate used for OpenLABEL velocity (default 30). |
+| `--los-spec FILE` | JSON list `[[grade, upper_density], …]` overriding the default HCM LOS thresholds. |
+| `--time-series` | Include per-frame density/occupancy arrays in the output. |
+| `--json FILE` | Write the result JSON to FILE (also printed to stdout). |
+
+Exactly one of `--omegaprime` / `--openlabel` is required. Vehicle positions (global
+UTM) are aligned to the map's local frame using the map `geoReference`, then each vehicle
+is assigned to the driving lane that contains it. All metrics are computed per frame and
+reported as mean / peak / p95 / min summaries (full series under `--time-series`).
+
+See [TRAFFIC_DENSITY.md](TRAFFIC_DENSITY.md) for a detailed explanation of the pipeline,
+the geometry, and how each metric is calculated and interpreted.
+
+### Density definitions produced
+
+| Section | Meaning | How |
+|---|---|---|
+| `whole_scene` | Network-wide density (veh per lane-km) + mean LOS. | on-road vehicle count / total driving-lane-km. |
+| `per_lane` | Per-lane mean/peak density (veh/km) + worst-case LOS, sorted by peak. | per-lane count / lane length. Ring arcs merge into one `ring` road and each junction's connectors merge into one `junction <id>` entry (a `null` lane marks a merge). |
+| `area_occupancy` | Footprint-area occupancy fraction and veh/m². Geometry-agnostic. | Σ(L·W of on-road vehicles) / drivable area. |
+| `speed_flow` | Space-mean speed (km/h) and flow q = k·v (veh/h/lane). | harmonic-mean speed of moving vehicles; flow from whole-scene density × speed. |
+| `roundabout` | Ring occupancy (veh, veh/km, area fraction) and per-approach density. Only when a roundabout is detected. | ring = non-junction roads at near-constant radius about the scene centre; approaches = the remaining non-junction roads. |
+
+**LOS caveat:** the default Level-of-Service grades are HCM6 *basic freeway-segment*
+density thresholds (veh/km/lane: A ≤7, B ≤11, C ≤16, D ≤22, E ≤28, F >28). They are only
+indicative for urban arterials and roundabouts — override with `--los-spec` if you have
+campaign-appropriate thresholds.
 
 ---
 
