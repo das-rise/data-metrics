@@ -19,6 +19,8 @@ classifiers = [
 
 # data_metrics.py needs numpy/opencv/av at import time, and pandas + mcap for the
 # OmegaPrime (MCAP) metrics. data_metrics_summary.py is pure standard library.
+# traffic_density.py needs pyproj (CRS alignment) and shapely (lane geometry);
+# it reuses pandas + mcap for the OmegaPrime source.
 dependencies = [
     "numpy>=1.24.0",
     "opencv-python>=4.8.0",
@@ -26,11 +28,14 @@ dependencies = [
     "pandas>=2.0.0",
     "mcap>=1.0.0",
     "mcap-protobuf-support>=0.5.0",
+    "pyproj>=3.4.0",
+    "shapely>=2.0.0",
 ]
 
 [project.scripts]
 data-metrics = "data_metrics:main"
 data-metrics-summary = "data_metrics_summary:main"
+traffic-density = "traffic_density:main"
 
 [tool.setuptools]
-py-modules = ["data_metrics", "data_metrics_summary"]
+py-modules = ["data_metrics", "data_metrics_summary", "traffic_density"]
