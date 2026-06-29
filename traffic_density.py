@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
-from pyproj import Transformer
+import opendrive_map as odm
 from shapely.geometry import Point, Polygon
 from shapely.ops import unary_union
 from shapely.strtree import STRtree
@@ -98,20 +98,11 @@ def _strip_ns(root: ET.Element) -> ET.Element:
     return root
 
 
-def _geo_offset(geo_text: str) -> Tuple[float, float, str]:
-    """Return (e0, n0, base_crs) for an OpenDRIVE geoReference.
-
-    The map frame is the projected CRS shifted so that (lon_0, lat_0) is the origin;
-    map-local = global_projected - proj(lon_0, lat_0).
-    """
-    lat0 = re.search(r"\+lat_0=([0-9.eE+\-]+)", geo_text)
-    lon0 = re.search(r"\+lon_0=([0-9.eE+\-]+)", geo_text)
-    base = re.sub(r"\s*\+(lat|lon)_0=[0-9.eE+\-]+", "", geo_text).strip()
-    if not (lat0 and lon0):
-        return 0.0, 0.0, base
-    e0, n0 = Transformer.from_crs("EPSG:4326", base, always_xy=True).transform(
-        float(lon0.group(1)), float(lat0.group(1)))
-    return e0, n0, base
+def _base_crs(geo_reference: Optional[str]) -> str:
+    """Projected CRS string with the (redundant for UTM) +lat_0/+lon_0 stripped."""
+    if not geo_reference:
+        return ""
+    return re.sub(r"\s*\+(lat|lon)_0=[0-9.eE+\-]+", "", geo_reference).strip()
 
 
 def _sample_geometry(g: ET.Element, step: float) -> List[Tuple[float, float, float]]:
@@ -144,42 +135,6 @@ def _road_reference(road: ET.Element, step: float) -> List[Tuple[float, float, f
     for g in road.find("planView").findall("geometry"):
         pts.extend(_sample_geometry(g, step))
     return pts
-
-
-def _polyline_length(pts: np.ndarray) -> float:
-    return float(np.hypot(*np.diff(pts, axis=0).T).sum()) if len(pts) > 1 else 0.0
-
-
-def _build_driving_lanes(road: ET.Element, ref: List[Tuple[float, float, float]]) -> List[Lane]:
-    """Build a Lane (polygon + centreline) for each driving lane of a road.
-
-    Lane widths are taken as constant (the 'a' coefficient); higher-order terms are
-    absent in the supported maps. Right lanes (negative id) offset along -normal.
-    """
-    ref_arr = np.array(ref)
-    normals = np.column_stack([-np.sin(ref_arr[:, 2]), np.cos(ref_arr[:, 2])])
-    base = ref_arr[:, :2]
-    sec = road.find("lanes/laneSection")
-    lanes: List[Lane] = []
-    for side, sign in (("left", 1.0), ("right", -1.0)):
-        group = sec.find(side)
-        if group is None:
-            continue
-        inner = 0.0
-        for ln in sorted(group.findall("lane"), key=lambda l: abs(int(l.attrib["id"]))):
-            width = float(ln.find("width").attrib["a"])
-            outer = inner + width
-            if ln.attrib.get("type") == "driving":
-                centre = base + sign * (inner + width / 2) * normals
-                inb = base + sign * inner * normals
-                oub = base + sign * outer * normals
-                poly = Polygon(np.vstack([oub, inb[::-1]])).buffer(0)
-                if not poly.is_empty:
-                    lanes.append(Lane(road.attrib["id"], int(ln.attrib["id"]),
-                                      road.attrib["junction"], poly,
-                                      _polyline_length(centre), centre))
-            inner = outer
-    return lanes
 
 
 def _circumferential_fraction(centerline: np.ndarray, centre: Tuple[float, float]) -> float:
@@ -259,12 +214,14 @@ def _classify_roundabout(lanes: List[Lane],
 
 def parse_opendrive(path: str) -> RoadNetwork:
     """Parse an OpenDRIVE map file into driving-lane geometry (map-local metric frame)."""
-    return _network_from_root(_strip_ns(ET.parse(path).getroot()))
+    od = odm.RoadNetwork.from_file(path, lane_types=["driving"], interval=_LANE_SAMPLE_STEP_M)
+    return _network_from_odmap(od, _strip_ns(ET.parse(path).getroot()))
 
 
 def parse_opendrive_text(xml: str) -> RoadNetwork:
     """Parse an OpenDRIVE map from an in-memory XML string (e.g. embedded in an MCAP)."""
-    return _network_from_root(_strip_ns(ET.fromstring(xml)))
+    od = odm.RoadNetwork.from_text(xml, lane_types=["driving"], interval=_LANE_SAMPLE_STEP_M)
+    return _network_from_odmap(od, _strip_ns(ET.fromstring(xml)))
 
 
 def _road_point_at_s(road: ET.Element, s: float) -> Tuple[float, float, float]:
@@ -302,15 +259,18 @@ def _parking_areas(root: ET.Element) -> List[Polygon]:
     return polys
 
 
-def _network_from_root(root: ET.Element) -> RoadNetwork:
-    """Build the RoadNetwork from a namespace-stripped OpenDRIVE root element."""
-    geo = root.find("header/geoReference")
-    e0, n0, crs = _geo_offset(geo.text if geo is not None else "")
-    lanes: List[Lane] = []
-    for road in root.findall("road"):
-        ref = _road_reference(road, _LANE_SAMPLE_STEP_M)
-        if ref:
-            lanes.extend(_build_driving_lanes(road, ref))
+def _network_from_odmap(od: "odm.RoadNetwork", root: ET.Element) -> RoadNetwork:
+    """Adapt an opendrive-map network into the metrics RoadNetwork (lanes + domain logic).
+
+    Lane geometry, the authoritative header <offset> and the CRS come from opendrive-map;
+    roundabout roles, parking areas and junction names are metrics-domain logic kept here.
+    """
+    road_junction = {r.id: r.junction for r in od.roads}
+    lanes = [
+        Lane(ml.road_id, ml.lane_id, road_junction.get(ml.road_id, "-1"),
+             ml.polygon, ml.length_m, ml.centerline)
+        for ml in od.lanes
+    ]
     if not lanes:
         raise ValueError("OpenDRIVE map has no driving lanes")
     polygons = [ln.polygon for ln in lanes]
@@ -321,6 +281,10 @@ def _network_from_root(root: ET.Element) -> RoadNetwork:
     junction_names = {j.attrib["id"]: j.attrib.get("name", "")
                       for j in root.findall("junction")}
     parking = _parking_areas(root)
+    # Authoritative map offset comes from the header <offset>, not the redundant
+    # geoReference +lat_0/+lon_0 (which may be absent on standard UTM maps).
+    e0, n0, _z = od.offset
+    crs = _base_crs(od.geo_reference)
     return RoadNetwork(lanes, polygons, STRtree(polygons), drivable, e0, n0, crs, centre,
                        has_roundabout, junction_names, parking,
                        STRtree(parking) if parking else None)
