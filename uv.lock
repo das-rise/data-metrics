@@ -164,7 +164,7 @@ requires-dist = [
     { name = "mcap-protobuf-support", specifier = ">=0.5.0" },
     { name = "numpy", specifier = ">=1.24.0" },
     { name = "opencv-python", specifier = ">=4.8.0" },
-    { name = "opendrive-map", editable = "../ORBIT/opendrive-map" },
+    { name = "opendrive-map", git = "https://github.com/RI-SE/ORBIT.git?subdirectory=opendrive-map&tag=opendrive-map-v0.1.0" },
     { name = "pandas", specifier = ">=2.0.0" },
     { name = "pyproj", specifier = ">=3.4.0" },
     { name = "shapely", specifier = ">=2.0.0" },
@@ -548,7 +548,7 @@ wheels = [
 [[package]]
 name = "opendrive-map"
 version = "0.1.0"
-source = { editable = "../ORBIT/opendrive-map" }
+source = { git = "https://github.com/RI-SE/ORBIT.git?subdirectory=opendrive-map&tag=opendrive-map-v0.1.0#5e5b0d1ba63d6553bc787fe3b0ecfbcd6c4a70cd" }
 dependencies = [
     { name = "numpy", version = "2.0.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.10'" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.10.*'" },
@@ -560,15 +560,6 @@ dependencies = [
     { name = "shapely", version = "2.0.7", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.10'" },
     { name = "shapely", version = "2.1.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.10'" },
 ]
-
-[package.metadata]
-requires-dist = [
-    { name = "numpy", specifier = ">=1.20.0" },
-    { name = "pyproj", specifier = ">=3.0.0" },
-    { name = "pytest", marker = "extra == 'dev'" },
-    { name = "shapely", specifier = ">=2.0" },
-]
-provides-extras = ["dev"]
 
 [[package]]
 name = "pandas"
