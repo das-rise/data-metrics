@@ -105,36 +105,6 @@ def _base_crs(geo_reference: Optional[str]) -> str:
     return re.sub(r"\s*\+(lat|lon)_0=[0-9.eE+\-]+", "", geo_reference).strip()
 
 
-def _sample_geometry(g: ET.Element, step: float) -> List[Tuple[float, float, float]]:
-    """Sample one planView <geometry> as (x, y, heading) points in map-local metres."""
-    x0, y0 = float(g.attrib["x"]), float(g.attrib["y"])
-    hdg, length = float(g.attrib["hdg"]), float(g.attrib["length"])
-    n = max(2, int(math.ceil(length / step)) + 1)
-    pp = g.find("paramPoly3")
-    if pp is None:                              # straight line
-        return [(x0 + s * math.cos(hdg), y0 + s * math.sin(hdg), hdg)
-                for s in np.linspace(0.0, length, n)]
-    a = pp.attrib
-    cu = [float(a[k]) for k in ("aU", "bU", "cU", "dU")]
-    cv = [float(a[k]) for k in ("aV", "bV", "cV", "dV")]
-    pts = []
-    for p in np.linspace(0.0, 1.0, n):
-        u = cu[0] + cu[1] * p + cu[2] * p * p + cu[3] * p ** 3
-        v = cv[0] + cv[1] * p + cv[2] * p * p + cv[3] * p ** 3
-        du = cu[1] + 2 * cu[2] * p + 3 * cu[3] * p * p
-        dv = cv[1] + 2 * cv[2] * p + 3 * cv[3] * p * p
-        x = x0 + u * math.cos(hdg) - v * math.sin(hdg)
-        y = y0 + u * math.sin(hdg) + v * math.cos(hdg)
-        pts.append((x, y, hdg + math.atan2(dv, du)))
-    return pts
-
-
-def _road_reference(road: ET.Element, step: float) -> List[Tuple[float, float, float]]:
-    """Concatenated reference-line samples across a road's planView geometries."""
-    pts: List[Tuple[float, float, float]] = []
-    for g in road.find("planView").findall("geometry"):
-        pts.extend(_sample_geometry(g, step))
-    return pts
 
 
 def _circumferential_fraction(centerline: np.ndarray, centre: Tuple[float, float]) -> float:
@@ -224,41 +194,6 @@ def parse_opendrive_text(xml: str) -> RoadNetwork:
     return _network_from_odmap(od, _strip_ns(ET.fromstring(xml)))
 
 
-def _road_point_at_s(road: ET.Element, s: float) -> Tuple[float, float, float]:
-    """(x, y, heading) at reference-line arc-length `s` on a road (sampled, interpolated)."""
-    pts = _road_reference(road, 0.5)
-    xy = np.array([(p[0], p[1]) for p in pts])
-    hd = np.array([p[2] for p in pts])
-    cum = np.concatenate([[0.0], np.cumsum(np.hypot(*np.diff(xy, axis=0).T))])
-    i = min(int(np.searchsorted(cum, s)), len(xy) - 1)
-    return xy[i, 0], xy[i, 1], hd[i]
-
-
-def _parking_areas(root: ET.Element) -> List[Polygon]:
-    """World-frame polygons for every `<object type="parking">` outline in the map.
-
-    An object sits at arc-length `s`, lateral offset `t` and heading `hdg` on its road; its
-    `cornerLocal` (u, v) corners are placed by the road heading there. These are the parking
-    lots your map renders — vehicles inside them are parking, not road traffic.
-    """
-    polys: List[Polygon] = []
-    for road in root.findall("road"):
-        for obj in road.findall(".//object"):
-            corners = obj.findall(".//cornerLocal")
-            if obj.attrib.get("type") != "parking" or len(corners) < 3:
-                continue
-            x0, y0, th = _road_point_at_s(road, float(obj.attrib.get("s", 0)))
-            t, hdg = float(obj.attrib.get("t", 0)), float(obj.attrib.get("hdg", 0))
-            ox, oy = x0 - math.sin(th) * t, y0 + math.cos(th) * t
-            ca, sa = math.cos(th + hdg), math.sin(th + hdg)
-            pts = [(ox + u * ca - v * sa, oy + u * sa + v * ca)
-                   for u, v in ((float(c.attrib["u"]), float(c.attrib["v"])) for c in corners)]
-            poly = Polygon(pts).buffer(0)
-            if not poly.is_empty:
-                polys.append(poly)
-    return polys
-
-
 def _network_from_odmap(od: "odm.RoadNetwork", root: ET.Element) -> RoadNetwork:
     """Adapt an opendrive-map network into the metrics RoadNetwork (lanes + domain logic).
 
@@ -280,7 +215,7 @@ def _network_from_odmap(od: "odm.RoadNetwork", root: ET.Element) -> RoadNetwork:
     has_roundabout, centre = _classify_roundabout(lanes, centre)
     junction_names = {j.attrib["id"]: j.attrib.get("name", "")
                       for j in root.findall("junction")}
-    parking = _parking_areas(root)
+    parking = list(od.parking_polygons)  # placed parking polygons (local frame)
     # Authoritative map offset comes from the header <offset>, not the redundant
     # geoReference +lat_0/+lon_0 (which may be absent on standard UTM maps).
     e0, n0, _z = od.offset
