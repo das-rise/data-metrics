@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
-from pyproj import Transformer
+import opendrive_map as odm
 from shapely.geometry import Point, Polygon
 from shapely.ops import unary_union
 from shapely.strtree import STRtree
@@ -98,88 +98,13 @@ def _strip_ns(root: ET.Element) -> ET.Element:
     return root
 
 
-def _geo_offset(geo_text: str) -> Tuple[float, float, str]:
-    """Return (e0, n0, base_crs) for an OpenDRIVE geoReference.
-
-    The map frame is the projected CRS shifted so that (lon_0, lat_0) is the origin;
-    map-local = global_projected - proj(lon_0, lat_0).
-    """
-    lat0 = re.search(r"\+lat_0=([0-9.eE+\-]+)", geo_text)
-    lon0 = re.search(r"\+lon_0=([0-9.eE+\-]+)", geo_text)
-    base = re.sub(r"\s*\+(lat|lon)_0=[0-9.eE+\-]+", "", geo_text).strip()
-    if not (lat0 and lon0):
-        return 0.0, 0.0, base
-    e0, n0 = Transformer.from_crs("EPSG:4326", base, always_xy=True).transform(
-        float(lon0.group(1)), float(lat0.group(1)))
-    return e0, n0, base
+def _base_crs(geo_reference: Optional[str]) -> str:
+    """Projected CRS string with the (redundant for UTM) +lat_0/+lon_0 stripped."""
+    if not geo_reference:
+        return ""
+    return re.sub(r"\s*\+(lat|lon)_0=[0-9.eE+\-]+", "", geo_reference).strip()
 
 
-def _sample_geometry(g: ET.Element, step: float) -> List[Tuple[float, float, float]]:
-    """Sample one planView <geometry> as (x, y, heading) points in map-local metres."""
-    x0, y0 = float(g.attrib["x"]), float(g.attrib["y"])
-    hdg, length = float(g.attrib["hdg"]), float(g.attrib["length"])
-    n = max(2, int(math.ceil(length / step)) + 1)
-    pp = g.find("paramPoly3")
-    if pp is None:                              # straight line
-        return [(x0 + s * math.cos(hdg), y0 + s * math.sin(hdg), hdg)
-                for s in np.linspace(0.0, length, n)]
-    a = pp.attrib
-    cu = [float(a[k]) for k in ("aU", "bU", "cU", "dU")]
-    cv = [float(a[k]) for k in ("aV", "bV", "cV", "dV")]
-    pts = []
-    for p in np.linspace(0.0, 1.0, n):
-        u = cu[0] + cu[1] * p + cu[2] * p * p + cu[3] * p ** 3
-        v = cv[0] + cv[1] * p + cv[2] * p * p + cv[3] * p ** 3
-        du = cu[1] + 2 * cu[2] * p + 3 * cu[3] * p * p
-        dv = cv[1] + 2 * cv[2] * p + 3 * cv[3] * p * p
-        x = x0 + u * math.cos(hdg) - v * math.sin(hdg)
-        y = y0 + u * math.sin(hdg) + v * math.cos(hdg)
-        pts.append((x, y, hdg + math.atan2(dv, du)))
-    return pts
-
-
-def _road_reference(road: ET.Element, step: float) -> List[Tuple[float, float, float]]:
-    """Concatenated reference-line samples across a road's planView geometries."""
-    pts: List[Tuple[float, float, float]] = []
-    for g in road.find("planView").findall("geometry"):
-        pts.extend(_sample_geometry(g, step))
-    return pts
-
-
-def _polyline_length(pts: np.ndarray) -> float:
-    return float(np.hypot(*np.diff(pts, axis=0).T).sum()) if len(pts) > 1 else 0.0
-
-
-def _build_driving_lanes(road: ET.Element, ref: List[Tuple[float, float, float]]) -> List[Lane]:
-    """Build a Lane (polygon + centreline) for each driving lane of a road.
-
-    Lane widths are taken as constant (the 'a' coefficient); higher-order terms are
-    absent in the supported maps. Right lanes (negative id) offset along -normal.
-    """
-    ref_arr = np.array(ref)
-    normals = np.column_stack([-np.sin(ref_arr[:, 2]), np.cos(ref_arr[:, 2])])
-    base = ref_arr[:, :2]
-    sec = road.find("lanes/laneSection")
-    lanes: List[Lane] = []
-    for side, sign in (("left", 1.0), ("right", -1.0)):
-        group = sec.find(side)
-        if group is None:
-            continue
-        inner = 0.0
-        for ln in sorted(group.findall("lane"), key=lambda l: abs(int(l.attrib["id"]))):
-            width = float(ln.find("width").attrib["a"])
-            outer = inner + width
-            if ln.attrib.get("type") == "driving":
-                centre = base + sign * (inner + width / 2) * normals
-                inb = base + sign * inner * normals
-                oub = base + sign * outer * normals
-                poly = Polygon(np.vstack([oub, inb[::-1]])).buffer(0)
-                if not poly.is_empty:
-                    lanes.append(Lane(road.attrib["id"], int(ln.attrib["id"]),
-                                      road.attrib["junction"], poly,
-                                      _polyline_length(centre), centre))
-            inner = outer
-    return lanes
 
 
 def _circumferential_fraction(centerline: np.ndarray, centre: Tuple[float, float]) -> float:
@@ -259,58 +184,28 @@ def _classify_roundabout(lanes: List[Lane],
 
 def parse_opendrive(path: str) -> RoadNetwork:
     """Parse an OpenDRIVE map file into driving-lane geometry (map-local metric frame)."""
-    return _network_from_root(_strip_ns(ET.parse(path).getroot()))
+    od = odm.RoadNetwork.from_file(path, lane_types=["driving"], interval=_LANE_SAMPLE_STEP_M)
+    return _network_from_odmap(od, _strip_ns(ET.parse(path).getroot()))
 
 
 def parse_opendrive_text(xml: str) -> RoadNetwork:
     """Parse an OpenDRIVE map from an in-memory XML string (e.g. embedded in an MCAP)."""
-    return _network_from_root(_strip_ns(ET.fromstring(xml)))
+    od = odm.RoadNetwork.from_text(xml, lane_types=["driving"], interval=_LANE_SAMPLE_STEP_M)
+    return _network_from_odmap(od, _strip_ns(ET.fromstring(xml)))
 
 
-def _road_point_at_s(road: ET.Element, s: float) -> Tuple[float, float, float]:
-    """(x, y, heading) at reference-line arc-length `s` on a road (sampled, interpolated)."""
-    pts = _road_reference(road, 0.5)
-    xy = np.array([(p[0], p[1]) for p in pts])
-    hd = np.array([p[2] for p in pts])
-    cum = np.concatenate([[0.0], np.cumsum(np.hypot(*np.diff(xy, axis=0).T))])
-    i = min(int(np.searchsorted(cum, s)), len(xy) - 1)
-    return xy[i, 0], xy[i, 1], hd[i]
+def _network_from_odmap(od: "odm.RoadNetwork", root: ET.Element) -> RoadNetwork:
+    """Adapt an opendrive-map network into the metrics RoadNetwork (lanes + domain logic).
 
-
-def _parking_areas(root: ET.Element) -> List[Polygon]:
-    """World-frame polygons for every `<object type="parking">` outline in the map.
-
-    An object sits at arc-length `s`, lateral offset `t` and heading `hdg` on its road; its
-    `cornerLocal` (u, v) corners are placed by the road heading there. These are the parking
-    lots your map renders — vehicles inside them are parking, not road traffic.
+    Lane geometry, the authoritative header <offset> and the CRS come from opendrive-map;
+    roundabout roles, parking areas and junction names are metrics-domain logic kept here.
     """
-    polys: List[Polygon] = []
-    for road in root.findall("road"):
-        for obj in road.findall(".//object"):
-            corners = obj.findall(".//cornerLocal")
-            if obj.attrib.get("type") != "parking" or len(corners) < 3:
-                continue
-            x0, y0, th = _road_point_at_s(road, float(obj.attrib.get("s", 0)))
-            t, hdg = float(obj.attrib.get("t", 0)), float(obj.attrib.get("hdg", 0))
-            ox, oy = x0 - math.sin(th) * t, y0 + math.cos(th) * t
-            ca, sa = math.cos(th + hdg), math.sin(th + hdg)
-            pts = [(ox + u * ca - v * sa, oy + u * sa + v * ca)
-                   for u, v in ((float(c.attrib["u"]), float(c.attrib["v"])) for c in corners)]
-            poly = Polygon(pts).buffer(0)
-            if not poly.is_empty:
-                polys.append(poly)
-    return polys
-
-
-def _network_from_root(root: ET.Element) -> RoadNetwork:
-    """Build the RoadNetwork from a namespace-stripped OpenDRIVE root element."""
-    geo = root.find("header/geoReference")
-    e0, n0, crs = _geo_offset(geo.text if geo is not None else "")
-    lanes: List[Lane] = []
-    for road in root.findall("road"):
-        ref = _road_reference(road, _LANE_SAMPLE_STEP_M)
-        if ref:
-            lanes.extend(_build_driving_lanes(road, ref))
+    road_junction = {r.id: r.junction for r in od.roads}
+    lanes = [
+        Lane(ml.road_id, ml.lane_id, road_junction.get(ml.road_id, "-1"),
+             ml.polygon, ml.length_m, ml.centerline)
+        for ml in od.lanes
+    ]
     if not lanes:
         raise ValueError("OpenDRIVE map has no driving lanes")
     polygons = [ln.polygon for ln in lanes]
@@ -320,7 +215,11 @@ def _network_from_root(root: ET.Element) -> RoadNetwork:
     has_roundabout, centre = _classify_roundabout(lanes, centre)
     junction_names = {j.attrib["id"]: j.attrib.get("name", "")
                       for j in root.findall("junction")}
-    parking = _parking_areas(root)
+    parking = list(od.parking_polygons)  # placed parking polygons (local frame)
+    # Authoritative map offset comes from the header <offset>, not the redundant
+    # geoReference +lat_0/+lon_0 (which may be absent on standard UTM maps).
+    e0, n0, _z = od.offset
+    crs = _base_crs(od.geo_reference)
     return RoadNetwork(lanes, polygons, STRtree(polygons), drivable, e0, n0, crs, centre,
                        has_roundabout, junction_names, parking,
                        STRtree(parking) if parking else None)
@@ -354,9 +253,21 @@ def load_omegaprime(path: str):
         for _, _, _, gt in make_reader(f, decoder_factories=[DecoderFactory()]) \
                 .iter_decoded_messages(topics=["ground_truth"]):
             t = gt.timestamp.seconds * 1_000_000_000 + gt.timestamp.nanos
+            # OSI proj_frame_offset maps object (OSI) coords to the proj_string CRS:
+            # world = R(yaw)·osi + offset. Normalise to that global frame here, so the
+            # later map-offset subtraction localises correctly whether the producer
+            # wrote global (offset absent) or local (offset = map origin) coordinates.
+            pfo = getattr(gt, "proj_frame_offset", None)
+            ox = oy = 0.0
+            cy_, sy_ = 1.0, 0.0
+            if pfo is not None and pfo.position is not None:
+                ox, oy = pfo.position.x, pfo.position.y
+                cy_, sy_ = math.cos(pfo.yaw), math.sin(pfo.yaw)
             for mo in gt.moving_object:
                 b = mo.base
-                rows.append((t, int(mo.id.value), b.position.x, b.position.y,
+                gx = b.position.x * cy_ - b.position.y * sy_ + ox
+                gy = b.position.x * sy_ + b.position.y * cy_ + oy
+                rows.append((t, int(mo.id.value), gx, gy,
                              b.orientation.yaw, b.dimension.length, b.dimension.width,
                              b.velocity.x, b.velocity.y,
                              _OSI_VEHICLE_GROUP.get(int(mo.vehicle_classification.type), "other")))
@@ -377,22 +288,22 @@ def _read_json_any(path: str):
         magic = f.read(6)
     if magic[:2] == b"\x1f\x8b":
         import gzip
-        opener = lambda: gzip.open(path, "rb")
+        fh = gzip.open(path, "rb")
     elif magic[:3] == b"BZh":
         import bz2
-        opener = lambda: bz2.open(path, "rb")
+        fh = bz2.open(path, "rb")
     elif magic[:6] == b"\xfd7zXZ\x00":
         import lzma
-        opener = lambda: lzma.open(path, "rb")
+        fh = lzma.open(path, "rb")
     elif magic[:4] == b"PK\x03\x04":
         import zipfile
         zf = zipfile.ZipFile(path)
         names = [n for n in zf.namelist() if not n.endswith("/")]
         member = next((n for n in names if n.lower().endswith(".json")), names[0])
-        opener = lambda: zf.open(member)
+        fh = zf.open(member)
     else:
-        opener = lambda: open(path, "rb")
-    with opener() as fh:
+        fh = open(path, "rb")
+    with fh:
         return json.load(fh)
 
 

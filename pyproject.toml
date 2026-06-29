@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "data-metrics"
-version = "0.1.0"
+version = "0.2.0"
 description = "Quality metrics for video (MP4) and OmegaPrime (MCAP) datasets, with a dataset-level summary tool."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -30,6 +30,7 @@ dependencies = [
     "mcap-protobuf-support>=0.5.0",
     "pyproj>=3.4.0",
     "shapely>=2.0.0",
+    "opendrive-map",
 ]
 
 [project.scripts]
@@ -39,3 +40,8 @@ traffic-density = "traffic_density:main"
 
 [tool.setuptools]
 py-modules = ["data_metrics", "data_metrics_summary", "traffic_density"]
+
+# opendrive-map is a standalone package living as a subdirectory of the ORBIT
+# repo, pinned here to a git tag. Bump the tag to upgrade.
+[tool.uv.sources]
+opendrive-map = { git = "https://github.com/RI-SE/ORBIT.git", subdirectory = "opendrive-map", tag = "opendrive-map-v0.1.0" }
