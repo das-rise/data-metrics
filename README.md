@@ -121,45 +121,75 @@ sub-threshold values flagged.
 
 ---
 
-## `traffic_density.py` — traffic density / flow metrics
+## `traffic_density.py` — traffic density / flow / roundabout metrics
 
 ```
-traffic-density --opendrive MAP.xodr (--omegaprime FILE | --openlabel FILE)
-                [--expected-hz HZ] [--los-spec FILE] [--time-series] [--json FILE]
+traffic-density (--omegaprime FILE | --openlabel FILE) [--opendrive MAP.xodr]
+                [--expected-hz HZ] [--los-spec FILE] [--time-series]
+                [--min-track-s S] [--static-disp-m M] [--max-speed-ms V] [--json FILE]
 ```
 
 | Option | Meaning |
 |---|---|
-| `--opendrive FILE` | OpenDRIVE `.xodr` map supplying lane geometry, lengths and the drivable surface (**required**). |
+| `--opendrive FILE` | OpenDRIVE `.xodr` map supplying lane geometry, lengths and the drivable surface. Optional with `--omegaprime`: if omitted, the map embedded in the MCAP (`ground_truth_map`) is used. Required for `--openlabel`. |
 | `--omegaprime FILE` | OmegaPrime MCAP trajectory source (has velocity). |
 | `--openlabel FILE` | OpenLABEL JSON trajectory source (world cuboids); velocity is finite-differenced. May be plain or gzip/zip/bz2/xz compressed (auto-detected). |
 | `--expected-hz HZ` | Frame rate used for OpenLABEL velocity (default 30). |
-| `--los-spec FILE` | JSON list `[[grade, upper_density], …]` overriding the default HCM LOS thresholds. |
+| `--los-spec FILE` | JSON list `[[grade, upper_control_delay_s], …]` overriding the default HCM delay-based LOS thresholds. |
+| `--min-track-s S` | Drop tracks shorter than this (s); default 0.5 — removes pseudo-label flicker. |
+| `--static-disp-m M` | Exclude vehicles whose centre moves less than this over their life, i.e. **parked** (m); default 2.0. |
+| `--max-speed-ms V` | Drop samples faster than this as teleports / ID-switches (m/s); default 55. |
 | `--time-series` | Include per-frame density/occupancy arrays in the output. |
 | `--json FILE` | Write the result JSON to FILE (also printed to stdout). |
 
-Exactly one of `--omegaprime` / `--openlabel` is required. Vehicle positions (global
-UTM) are aligned to the map's local frame using the map `geoReference`, then each vehicle
-is assigned to the driving lane that contains it. All metrics are computed per frame and
-reported as mean / peak / p95 / min summaries (full series under `--time-series`).
+Exactly one of `--omegaprime` / `--openlabel` is required. An OmegaPrime MCAP embeds its
+own OpenDRIVE map, so `--opendrive` may be omitted for an MCAP source; an OpenLABEL source
+always needs `--opendrive`. Vehicle positions (global UTM) are aligned to the map's local
+frame using the map `geoReference`, then each vehicle is assigned to the driving lane that
+contains it.
+
+**Trajectory cleaning.** Before any metric, tracks are cleaned (uniformly across sources, no
+confidence field exists in the data): short tracks are dropped (flicker), teleport/ID-switch
+samples are removed, and **parked/static vehicles are excluded from the traffic metrics** —
+they are not traffic and otherwise dominate counts (queued vehicles move eventually and are
+kept). Vehicles inside a mapped **parking area** (`<object type="parking">` outlines, which the
+tool parses into polygons) are likewise treated as parking, not road traffic — so a car that is
+parked and later drives off contributes only its on-road portion. What was filtered is reported
+in `data_quality`; thresholds are CLI-configurable.
+
+Density, flow and speed are reported with **Edie's generalized (space–time) definitions**
+over each region (`k = mean_count/L`, `v = mean sample speed`, `q = k·v`), which are robust
+to short segments. Per-frame summaries (mean / peak / p95 / min) are given for the
+instantaneous quantities; the full per-frame series is available under `--time-series`.
 
 See [TRAFFIC_DENSITY.md](TRAFFIC_DENSITY.md) for a detailed explanation of the pipeline,
 the geometry, and how each metric is calculated and interpreted.
 
-### Density definitions produced
+### Sections produced
 
 | Section | Meaning | How |
 |---|---|---|
-| `whole_scene` | Network-wide density (veh per lane-km) + mean LOS. | on-road vehicle count / total driving-lane-km. |
-| `per_lane` | Per-lane mean/peak density (veh/km) + worst-case LOS, sorted by peak. | per-lane count / lane length. Ring arcs merge into one `ring` road and each junction's connectors merge into one `junction <id>` entry (a `null` lane marks a merge). |
-| `area_occupancy` | Footprint-area occupancy fraction and veh/m². Geometry-agnostic. | Σ(L·W of on-road vehicles) / drivable area. |
-| `speed_flow` | Space-mean speed (km/h) and flow q = k·v (veh/h/lane). | harmonic-mean speed of moving vehicles; flow from whole-scene density × speed. |
-| `roundabout` | Ring occupancy (veh, veh/km, area fraction) and per-approach density. Only when a roundabout is detected. | ring = non-junction roads at near-constant radius about the scene centre; approaches = the remaining non-junction roads. |
+| `data_quality` | How clean/reliable the (pseudo-)labelled clip is. | object count, static/short/teleport counts, **parking** vehicles/samples, off-lane fraction, unknown-type objects, track-duration stats, what was removed. |
+| `geometry_agnostic` | Topology-free congestion indicators — the best cross-scene comparators (need only the drivable polygon). | area-occupancy fraction = Σ(L·W of on-road vehicles)/drivable area; veh/m². |
+| `network` | Whole drivable network: Edie density/flow/speed + an instantaneous-density summary. | Edie over all driving lanes; instantaneous = on-road count / total lane-km. |
+| `by_type` | Per coarse vehicle class (car/van/truck/bus/…): count + Edie density/flow/speed. | OSI subtype / OpenLABEL type grouped, Edie over the network. |
+| `roads` | Per driving-road density/flow/speed — generic per-segment metric for any scene. | Edie per `road_id`, sorted by flow. |
+| `junctions` | Turning movements (in-road → out-road counts, veh/h) per OpenDRIVE junction. | vehicle road sequences crossing each junction's connector roads. |
+| `roundabout` | Per-approach and ring analysis (only when a real roundabout loop is detected). | see below. |
 
-**LOS caveat:** the default Level-of-Service grades are HCM6 *basic freeway-segment*
-density thresholds (veh/km/lane: A ≤7, B ≤11, C ≤16, D ≤22, E ≤28, F >28). They are only
-indicative for urban arterials and roundabouts — override with `--los-spec` if you have
-campaign-appropriate thresholds.
+**`roundabout`** contains the circulating direction, the **ring** (Edie density/flow/speed,
+area occupancy, control delay → LOS), and one entry per **approach** arm with: `direction`
+(`entry`/`exit`, from radial-velocity sign), Edie density/flow/speed (the arm's cross-section
+flow, since Edie `q = N/T`), `circulating_flow_veh_per_h` (total flow crossing the ring at
+that arm — the conflicting flow that drives entry capacity), and control delay → LOS.
+A roundabout is reported only when the circumferential lanes form a **near-complete loop**
+(angular-sector coverage ≥ 75 %), so a short curved connector on a straight road is not
+mistaken for a ring.
+
+**LOS:** grades are the HCM **roundabout / unsignalized** scale by **control delay**
+(s/veh: A ≤10, B ≤15, C ≤25, D ≤35, E ≤50, F >50) — the correct scale for interrupted flow,
+not freeway density. Control delay is measured from trajectories (time lost vs the region's
+85th-percentile free-flow speed). Override the thresholds with `--los-spec`.
 
 ---
 
@@ -366,6 +396,13 @@ Completeness runs in Case 2.
 | `required_types` / `expected_types` | `TYPE_UNKNOWN` `TYPE_OTHER` `TYPE_VEHICLE` `TYPE_PEDESTRIAN` `TYPE_ANIMAL` |
 | `expected_subtypes` | `TYPE_UNKNOWN` `TYPE_OTHER` `TYPE_SMALL_CAR` `TYPE_COMPACT_CAR` `TYPE_CAR` `TYPE_LUXURY_CAR` `TYPE_VAN` `TYPE_HEAVY_TRUCK` `TYPE_SEMITRAILER` `TYPE_TRAILER` `TYPE_MOTORCYCLE` `TYPE_BICYCLE` `TYPE_BUS` `TYPE_TRAM` `TYPE_TRAIN` `TYPE_WHEELCHAIR` `TYPE_SEMITRACTOR` `TYPE_STANDUP_SCOOTER` `TYPE_MICROMOBILITY_DEVICE` `TYPE_WORK_MACHINE` `TYPE_WATERCRAFT` `TYPE_AIRCRAFT` `TYPE_LAND_VEHICLE` |
 | `expected_roles` | `ROLE_UNKNOWN` `ROLE_OTHER` `ROLE_CIVIL` `ROLE_AMBULANCE` `ROLE_FIRE` `ROLE_POLICE` `ROLE_PUBLIC_TRANSPORT` `ROLE_ROAD_ASSISTANCE` `ROLE_GARBAGE_COLLECTION` `ROLE_ROAD_CONSTRUCTION` `ROLE_MILITARY` |
+
+---
+
+## Development
+
+Known limitations and deferred design options are tracked in
+[DEVELOPMENT.md](DEVELOPMENT.md).
 
 ---
 
