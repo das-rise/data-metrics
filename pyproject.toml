@@ -40,3 +40,9 @@ traffic-density = "traffic_density:main"
 
 [tool.setuptools]
 py-modules = ["data_metrics", "data_metrics_summary", "traffic_density"]
+
+# opendrive-map is an unpublished sibling package (in the ORBIT repo). Until it is
+# published to a registry / git, resolve it from its local path. Switch to a git
+# source once the standalone packages are pushed.
+[tool.uv.sources]
+opendrive-map = { path = "../ORBIT/opendrive-map", editable = true }

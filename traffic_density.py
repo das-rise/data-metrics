@@ -318,9 +318,21 @@ def load_omegaprime(path: str):
         for _, _, _, gt in make_reader(f, decoder_factories=[DecoderFactory()]) \
                 .iter_decoded_messages(topics=["ground_truth"]):
             t = gt.timestamp.seconds * 1_000_000_000 + gt.timestamp.nanos
+            # OSI proj_frame_offset maps object (OSI) coords to the proj_string CRS:
+            # world = R(yaw)·osi + offset. Normalise to that global frame here, so the
+            # later map-offset subtraction localises correctly whether the producer
+            # wrote global (offset absent) or local (offset = map origin) coordinates.
+            pfo = getattr(gt, "proj_frame_offset", None)
+            ox = oy = 0.0
+            cy_, sy_ = 1.0, 0.0
+            if pfo is not None and pfo.position is not None:
+                ox, oy = pfo.position.x, pfo.position.y
+                cy_, sy_ = math.cos(pfo.yaw), math.sin(pfo.yaw)
             for mo in gt.moving_object:
                 b = mo.base
-                rows.append((t, int(mo.id.value), b.position.x, b.position.y,
+                gx = b.position.x * cy_ - b.position.y * sy_ + ox
+                gy = b.position.x * sy_ + b.position.y * cy_ + oy
+                rows.append((t, int(mo.id.value), gx, gy,
                              b.orientation.yaw, b.dimension.length, b.dimension.width,
                              b.velocity.x, b.velocity.y,
                              _OSI_VEHICLE_GROUP.get(int(mo.vehicle_classification.type), "other")))
@@ -341,22 +353,22 @@ def _read_json_any(path: str):
         magic = f.read(6)
     if magic[:2] == b"\x1f\x8b":
         import gzip
-        opener = lambda: gzip.open(path, "rb")
+        fh = gzip.open(path, "rb")
     elif magic[:3] == b"BZh":
         import bz2
-        opener = lambda: bz2.open(path, "rb")
+        fh = bz2.open(path, "rb")
     elif magic[:6] == b"\xfd7zXZ\x00":
         import lzma
-        opener = lambda: lzma.open(path, "rb")
+        fh = lzma.open(path, "rb")
     elif magic[:4] == b"PK\x03\x04":
         import zipfile
         zf = zipfile.ZipFile(path)
         names = [n for n in zf.namelist() if not n.endswith("/")]
         member = next((n for n in names if n.lower().endswith(".json")), names[0])
-        opener = lambda: zf.open(member)
+        fh = zf.open(member)
     else:
-        opener = lambda: open(path, "rb")
-    with opener() as fh:
+        fh = open(path, "rb")
+    with fh:
         return json.load(fh)
 
 
